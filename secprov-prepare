@@ -1,0 +1,198 @@
+#!/bin/python
+# Copyright (c) 2016, Patrick Uiterwijk <patrick@puiterwijk.org>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+provision_server_upload = 'https://mhhl3zwz91.execute-api.eu-west-1' + \
+                          '.amazonaws.com/prod/Puiterwijk-Provision'
+seed = 'ahve9fa3loShieW0ThoCaiv4oih1ohmo'
+
+import base64
+from getpass import getpass
+import copy
+import json
+import sys
+import hashlib
+import requests
+import subprocess
+
+
+def safe_to_print(metadata):
+    temp = copy.deepcopy(metadata)
+    for key in temp:
+        if isinstance(temp[key], dict):
+            temp[key] = safe_to_print(temp[key])
+        elif key.endswith('pw'):
+            temp[key] = '**not printed**'
+    return temp
+
+
+def encrypt_tpm():
+    def _encrypt_tpm(metadata):
+        metadata = json.dumps(metadata)
+        p = subprocess.Popen(['/bin/tpm_sealdata', '--well-known'],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        encrypted = p.communicate(metadata)[0]
+        return {'method': 'tpm_sealed',
+                'value': base64.b64encode(encrypted)}
+    return _encrypt_tpm
+
+
+import tempfile
+import os
+def decrypt_tpm(encrypted):
+    encrypted = encrypted['value']
+    encrypted = base64.b64decode(encrypted)
+    (encfile, encpath) = tempfile.mkstemp()
+    encfile = open(encpath, 'w')
+    encfile.write(encrypted)
+    encfile.close()
+    p = subprocess.Popen(['/bin/tpm_unsealdata', '--srk-well-known',
+                          '-i', encpath],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    metadata = p.communicate()[0]
+    os.remove(encpath)
+    return json.loads(metadata)
+
+
+
+def encrypt_yubikey(publickey):
+    def _encrypt_yubikey(metadata):
+        # TODO
+        # Probably want to sign as well so people can't tamper with it
+        raise NotImplementedError()
+        encrypted = metadata
+        return {'method': 'yubikey',
+                'value': encrypted}
+    return _encrypt_yubikey
+
+
+metadata = {'version': 1}
+
+
+def ask_yes_no(prompt):
+    prompt += ' [y/n]: '
+    read = '-'
+    while read not in ['y', 'n']:
+        read = raw_input(prompt)
+        read = read.lower()
+    return read == 'y'
+
+cursn = ''
+try:
+    cursn = open('/sys/devices/virtual/dmi/id/product_serial',
+                 'r').read().strip()
+except:
+    pass
+serial = raw_input('Target machine serial number [%s]: ' % cursn).strip()
+if serial == '':
+    if cursn == '':
+        print('Unable to determine serial number')
+        sys.exit(1)
+    serial = cursn
+metadata['serial'] = serial
+serial_hash = hashlib.sha256(serial + seed).hexdigest()
+
+do_luks = ask_yes_no('Configure LUKS passphrase')
+if do_luks:
+    luks = {}
+    luks['oldpw'] = getpass('Old LUKS passphrase: ')
+    luks['newpw'] = getpass('LUKS passphrase: ')
+    metadata['luks'] = luks
+
+do_rootpw = ask_yes_no('Configure root password')
+if do_rootpw:
+    metadata['rootpw'] = getpass('Root password: ')
+
+do_grub2 = ask_yes_no('Configure GRUB2 password')
+if do_grub2:
+    metadata['grub2pw'] = getpass('GRUB2 password: ')
+
+do_user = ask_yes_no('Configure user')
+if do_user:
+    user = {}
+    user['username'] = raw_input('Username: ')
+    user['fullname'] = raw_input('User full name: ')
+    user['userpw'] = getpass('User password: ')
+    metadata['user'] = user
+
+do_command = ask_yes_no('Configure command to run')
+if do_command:
+    metadata['command'] = raw_input('Command to execute: ')
+
+print('Captured metadata: ')
+print(json.dumps(safe_to_print(metadata),
+                 sort_keys=True,
+                 indent=4,
+                 separators=(',', ': ')))
+
+start = ask_yes_no('Use this metadata')
+if not start:
+    sys.exit(0)
+
+encryption_functions = []
+
+do_tpm = ask_yes_no('Use TPM')
+if do_tpm:
+    if not ask_yes_no('This is target machine'):
+        print('For TPM, this script must be run on target machine')
+        sys.exit(1)
+
+    encryption_functions.append(encrypt_tpm())
+
+do_yubikey = ask_yes_no('Use Yubikey')
+if do_yubikey:
+    pubkey = raw_input('Public key filename: ')
+    pubkey = open(pubkey, 'r').read()
+
+    encryption_functions.append(encrypt_yubikey(pubkey))
+
+if len(encryption_functions) < 1:
+    print('Please select at least one encryption method!')
+    sys.exit(1)
+
+encrypted = json.dumps(metadata)
+for f in encryption_functions:
+    encrypted = f(encrypted)
+wrapped = base64.b64encode(
+    json.dumps({'version': metadata['version'],
+                'wrapped': encrypted}))
+
+if not ask_yes_no('Upload'):
+    sys.exit(1)
+
+
+def try_upload(challenge=None, response=None):
+    payload = {'serial_hash': serial_hash,
+               'metadata': wrapped}
+    if challenge and response:
+        payload['challenge'] = challenge
+        payload['response'] = response
+
+    r = requests.post(provision_server_upload, data=json.dumps(payload))
+
+    return r.json()
+
+resp = try_upload()
+print('Response: %s' % resp)

@@ -1,0 +1,219 @@
+#!/bin/python
+# Copyright (c) 2016, Patrick Uiterwijk <patrick@puiterwijk.org>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+provision_server_download = 'http://provision.puiterwijk.org/%s'
+seed = 'ahve9fa3loShieW0ThoCaiv4oih1ohmo'
+
+# This is a base64-encoded version of system.data.auth as shipped with
+# trousers, since the Fedora package does not ship this file
+tcsd_system_auth = \
+    'AQEAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'BLwEAAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAQEABgARAAAAAAEAAAABAAMAAQAAAAwAAAgAAAAAAgAAAAAAAAAAAAABAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + \
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+
+import time
+import base64
+import json
+import sys
+import hashlib
+import subprocess
+import tempfile
+import os
+import copy
+import urllib2
+
+
+if os.path.exists('/etc/secprov_complete'):
+    print('Provisioning has been previously completed')
+    sys.exit(0)
+
+
+def safe_to_print(metadata):
+    temp = copy.deepcopy(metadata)
+    for key in temp:
+        if isinstance(temp[key], dict):
+            temp[key] = safe_to_print(temp[key])
+        elif key.endswith('pw'):
+            temp[key] = '**not printed**'
+    return temp
+
+
+def decrypt_tpm(encrypted):
+    if not os.path.exists('/var/lib/systemd.data'):
+        print('TCSD not configured. Putting blank system.data in place')
+        with open('/var/lib/systemd.data', 'wb') as datafile:
+            datafile.write(base64.b64decode(tcsd_system_auth))
+        print('Restarting tcsd...')
+        proc = subprocess.Popen(['/bin/systemctl', 'restart', 'tcsd.service'],
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        print(proc.communicate())
+        print('tcsd restarted')
+    encrypted = encrypted['value']
+    encrypted = base64.b64decode(encrypted)
+    (encfile, encpath) = tempfile.mkstemp()
+    encfile = open(encpath, 'w')
+    encfile.write(encrypted)
+    encfile.close()
+    p = subprocess.Popen(['/bin/tpm_unsealdata', '--srk-well-known',
+                          '-i', encpath],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    metadata = p.communicate()[0]
+    os.remove(encpath)
+    return json.loads(metadata)
+
+
+def decrypt_yubikey():
+    raise NotImplementedError()
+    # TODO
+
+
+serial = open('/sys/devices/virtual/dmi/id/product_serial', 'r').read().strip()
+serial_hash = hashlib.sha256(serial + seed).hexdigest()
+
+print('Retrieving file for %s (%s)' % (serial, serial_hash))
+
+
+retrieve_data = urllib2.urlopen(provision_server_download % serial_hash)
+encrypted = retrieve_data.read()
+print('Encrypted: %s' % encrypted)
+encrypted = base64.b64decode(encrypted)
+encrypted = json.loads(encrypted)
+
+if encrypted['version'] != 1:
+    print('Unknown metadata version!')
+    sys.exit(1)
+encrypted = encrypted['wrapped']
+print('Wrapped: %s' % encrypted)
+
+while 'method' in encrypted:
+    if encrypted['method'] == 'tpm_sealed':
+        encrypted = decrypt_tpm(encrypted)
+    else:
+        print('Unknown encryption method encountered: %s' % encrypted['method'])
+        sys.exit(1)
+
+metadata = json.loads(encrypted)
+print('Decrypted: %s' % safe_to_print(metadata))
+
+if 'luks' in metadata:
+    print('Applying LUKS passphrase change...')
+    inp = """%s
+%s
+%s""" % (metadata['luks']['oldpw'], metadata['luks']['newpw'],
+         metadata['luks']['newpw'])
+
+    proc = subprocess.Popen(['/sbin/cryptsetup', 'luksAddKey', '/dev/sda3'],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    print(proc.communicate(inp))
+
+    proc = subprocess.Popen(['/sbin/cryptsetup', 'luksRemoveKey', '/dev/sda3'],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    print(proc.communicate(metadata['luks']['oldpw']))
+    print('LUKS passphrase change applied')
+
+if 'rootpw' in metadata:
+    print('Applying root password change...')
+    proc = subprocess.Popen(['/bin/passwd', 'root', '--stdin'],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    print(proc.communicate(metadata['rootpw']))
+    print('Root password change applied')
+
+if 'grub2pw' in metadata:
+    print('Applying GRUB2 password change...')
+    proc = subprocess.Popen(['/bin/grub2-mkpasswd-pbkdf2'],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    pwd = proc.communicate('test1\ntest1')[0]
+    pwd = pwd.split('\n')[2].split(' ')[6]
+    users = """#!/bin/sh -e
+
+cat <<EOF
+set superusers="root"
+export superusers
+password_pbkdf2 root %s
+EOF""" % pwd
+    with open('/etc/grub.d/01_users', 'w') as usersfile:
+        usersfile.write(users)
+    outfile = '/boot/grub2/grub.cfg'
+    if os.path.exists('/boot/efi/EFI/redhat/grub.cfg'):
+        outfile = '/boot/efi/EFI/redhat/grub.cfg'
+    elif os.path.exists('/boot/efi/EFI/fedora/grub.cfg'):
+        outfile = '/boot/efi/EFI/fedora/grub.cfg'
+    proc = subprocess.Popen(['grub2-mkconfig', '-o', outfile],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    print(proc.communicate())
+    print('GRUB2 password change applied')
+
+if 'user' in metadata:
+    print('Creating new user...')
+    proc = subprocess.Popen(['/sbin/useradd', metadata['user']['username'],
+                             '--comment', metadata['user']['fullname']],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    print(proc.communicate())
+    proc = subprocess.Popen(['/bin/passwd', metadata['user']['username'],
+                             '--stdin'],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    print(proc.communicate(metadata['user']['userpw']))
+    print('New user created')
+
+if 'command' in metadata:
+    print('Running command...')
+    proc = subprocess.Popen(metadata['command'],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    print(proc.communicate())
+    print('Command ran')
+
+print('Recording completion...')
+with open('/etc/secprov_complete', 'w') as compfile:
+    compfile.write(str(time.time())
+print('Completion recorded')
+
+print('Done')
