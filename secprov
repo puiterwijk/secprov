@@ -71,9 +71,11 @@ def safe_to_print(metadata):
 
 
 def decrypt_tpm(encrypted):
-    if not os.path.exists('/var/lib/systemd.data'):
+    system_data = '/var/lib/tpm/system.data'
+    if (not os.path.exists(system_data)
+            or os.stat(system_data).st_size == 0):
         print('TCSD not configured. Putting blank system.data in place')
-        with open('/var/lib/systemd.data', 'wb') as datafile:
+        with open(system_data, 'wb') as datafile:
             datafile.write(base64.b64decode(tcsd_system_auth))
         print('Restarting tcsd...')
         proc = subprocess.Popen(['/bin/systemctl', 'restart', 'tcsd.service'],
